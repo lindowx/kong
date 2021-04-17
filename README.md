@@ -17,7 +17,7 @@ from startups to Global 5000 as well as government organizations.
 [Forum](https://discuss.konghq.com) |
 [Blog](https://konghq.com/blog) |
 IRC (freenode): [#kong](https://webchat.freenode.net/?channels=kong) |
-[Nightly Builds][kong-nightly-master]
+[Master Builds][kong-master-builds]
 
 ## Summary
 
@@ -122,10 +122,10 @@ code, other repos are also under active development:
   using Azure Resource Manager.
 - [Kong on Heroku](https://github.com/heroku/heroku-kong): Deploy Kong on
   Heroku in one click.
+- [Kong on IBM Cloud](https://github.com/andrew40404/installing-kong-IBM-cloud) - How to deploy Kong on IBM Cloud
 - [Kong and Instaclustr](https://www.instaclustr.com/solutions/managed-cassandra-for-kong/): Let
   Instaclustr manage your Cassandra cluster.
-- [Nightly Builds][kong-nightly-master]: Builds of the master branch available
-  every morning at about 9AM PST.
+- [Master Builds][kong-master-builds]: Docker images for each commit in the `master` branch.
 
 You can find every supported distribution at the [official installation page](https://konghq.com/install/).
 
@@ -138,7 +138,7 @@ experience (both for you and for the Kong team), please read
 you start.
 
 If you are planning on developing on Kong, you'll need a development
-installation. The `next` branch holds the latest unreleased source code.
+installation. The `master` branch holds the latest unreleased source code.
 
 You can read more about writing your own plugins in the [Plugin Development
 Guide](https://docs.konghq.com/latest/plugin-development/), or browse an
@@ -199,7 +199,7 @@ $ git clone https://github.com/Kong/kong
 $ cd kong/
 
 # you might want to switch to the development branch. See CONTRIBUTING.md
-$ git checkout next
+$ git checkout master
 
 # install the Lua sources
 $ luarocks make
@@ -207,7 +207,7 @@ $ luarocks make
 
 #### Running for development
 
-Check out the [development section](https://github.com/Kong/kong/blob/next/kong.conf.default#L244)
+Check out the [development section](https://github.com/Kong/kong/blob/master/kong.conf.default#L244)
 of the default configuration file for properties to tweak in order to ease
 the development process for Kong.
 
@@ -311,7 +311,7 @@ limitations under the License.
 [kong-url]: https://konghq.com/
 [kong-logo]: https://konghq.com/wp-content/uploads/2018/05/kong-logo-github-readme.png
 [kong-benefits]: https://konghq.com/wp-content/uploads/2018/05/kong-benefits-github-readme.png
-[kong-nightly-master]: https://bintray.com/kong/kong-nightly/master
+[kong-master-builds]: https://hub.docker.com/r/kong/kong/tags
 [badge-action-url]: https://github.com/Kong/kong/actions
 [badge-action-image]: https://github.com/Kong/kong/workflows/Build%20&%20Test/badge.svg
 

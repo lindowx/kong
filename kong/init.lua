@@ -71,7 +71,6 @@ local meta = require "kong.meta"
 local lapis = require "lapis"
 local runloop = require "kong.runloop.handler"
 local stream_api = require "kong.tools.stream_api"
-local clustering = require "kong.clustering"
 local singletons = require "kong.singletons"
 local declarative = require "kong.db.declarative"
 local ngx_balancer = require "ngx.balancer"
@@ -80,9 +79,11 @@ local certificate = require "kong.runloop.certificate"
 local concurrency = require "kong.concurrency"
 local cache_warmup = require "kong.cache.warmup"
 local balancer_execute = require("kong.runloop.balancer").execute
+local balancer_set_host_header = require("kong.runloop.balancer").set_host_header
 local kong_error_handlers = require "kong.error_handlers"
 local migrations_utils = require "kong.cmd.utils.migrations"
 local plugin_servers = require "kong.runloop.plugin_servers"
+local clustering
 
 local kong             = kong
 local ngx              = ngx
@@ -96,9 +97,11 @@ local ngx_ALERT        = ngx.ALERT
 local ngx_CRIT         = ngx.CRIT
 local ngx_ERR          = ngx.ERR
 local ngx_WARN         = ngx.WARN
+local ngx_NOTICE       = ngx.NOTICE
 local ngx_INFO         = ngx.INFO
 local ngx_DEBUG        = ngx.DEBUG
 local subsystem        = ngx.config.subsystem
+local start_time       = ngx.req.start_time
 local type             = type
 local error            = error
 local ipairs           = ipairs
@@ -116,13 +119,13 @@ if not enable_keepalive then
                     "set the 'nginx_upstream_keepalive' configuration ",
                     "property instead of 'upstream_keepalive_pool_size'")
 end
+if subsystem == "http" then
+  clustering = require "kong.clustering"
+end
 
 
-local WORKER_COUNT = ngx.worker.count()
 local DECLARATIVE_LOAD_KEY = constants.DECLARATIVE_LOAD_KEY
 local DECLARATIVE_HASH_KEY = constants.DECLARATIVE_HASH_KEY
-local DECLARATIVE_FLIPS_KEY = constants.DECLARATIVE_FLIPS.name
-local DECLARATIVE_FLIPS_TTL = constants.DECLARATIVE_FLIPS.ttl
 
 
 local declarative_entities
@@ -194,10 +197,10 @@ do
   reset_kong_shm = function(config)
     local kong_shm = ngx.shared.kong
     local dbless = config.database == "off"
-    local declarative_config = dbless and config.declarative_config
 
-    if dbless then -- prevent POST /config from happening while initializing
-      kong_shm:add(DECLARATIVE_FLIPS_KEY, 0, DECLARATIVE_FLIPS_TTL)
+    if dbless then
+      -- prevent POST /config while initializing dbless
+      declarative.try_lock()
     end
 
     local old_page = kong_shm:get(DECLARATIVE_PAGE_KEY)
@@ -208,14 +211,11 @@ do
 
     local preserved = {}
 
-    local new_page
-    if declarative_config then
-      new_page = old_page == 1 and 2 or 1
-
-    else
-      new_page = old_page
-
-      if dbless then
+    local new_page = old_page
+    if dbless then
+      if config.declarative_config then
+        new_page = old_page == 1 and 2 or 1
+      else
         preserved[DECLARATIVE_LOAD_KEY] = kong_shm:get(DECLARATIVE_LOAD_KEY)
         preserved[DECLARATIVE_HASH_KEY] = kong_shm:get(DECLARATIVE_HASH_KEY)
       end
@@ -229,7 +229,8 @@ do
 
     kong_shm:flush_all()
     if dbless then
-      kong_shm:add(DECLARATIVE_FLIPS_KEY, 0, DECLARATIVE_FLIPS_TTL)
+      -- reinstate the lock to hold POST /config, which was flushed with the previous `flush_all`
+      declarative.try_lock()
     end
     for key, value in pairs(preserved) do
       kong_shm:set(key, value)
@@ -380,12 +381,7 @@ local function load_declarative_config(kong_config, entities, meta)
   end)
 
   if ok then
-    if kong_shm:get(DECLARATIVE_FLIPS_KEY) then
-      local flips = kong_shm:incr(DECLARATIVE_FLIPS_KEY, 1)
-      if flips and flips >= WORKER_COUNT then
-        kong_shm:delete(DECLARATIVE_FLIPS_KEY)
-      end
-    end
+    declarative.try_unlock()
 
     local default_ws = kong.db.workspaces:select_by_name("default")
     kong.default_workspace = default_ws and default_ws.id or kong.default_workspace
@@ -634,14 +630,31 @@ function Kong.init_worker()
 end
 
 
+function Kong.ssl_certificate()
+  local ctx = ngx.ctx
+
+  kong_global.set_phase(kong, PHASES.certificate)
+
+  log_init_worker_errors(ctx)
+
+  -- this is the first phase to run on an HTTPS request
+  ctx.workspace = kong.default_workspace
+
+  runloop.certificate.before(ctx)
+  local plugins_iterator = runloop.get_updated_plugins_iterator()
+  execute_plugins_iterator(plugins_iterator, "certificate", ctx)
+  runloop.certificate.after(ctx)
+end
+
+
 function Kong.preread()
   local ctx = ngx.ctx
   if not ctx.KONG_PROCESSING_START then
-    ctx.KONG_PROCESSING_START = get_now_ms()
+    ctx.KONG_PROCESSING_START = start_time() * 1000
   end
 
   if not ctx.KONG_PREREAD_START then
-    ctx.KONG_PREREAD_START = ctx.KONG_PROCESSING_START
+    ctx.KONG_PREREAD_START = get_now_ms()
   end
 
   kong_global.set_phase(kong, PHASES.preread)
@@ -656,6 +669,7 @@ function Kong.preread()
   if not ctx.service then
     ctx.KONG_PREREAD_ENDED_AT = get_now_ms()
     ctx.KONG_PREREAD_TIME = ctx.KONG_PREREAD_ENDED_AT - ctx.KONG_PREREAD_START
+    ctx.KONG_RESPONSE_LATENCY = ctx.KONG_PREREAD_ENDED_AT - ctx.KONG_PROCESSING_START
 
     ngx_log(ngx_WARN, "no Service found with those values")
     return ngx.exit(503)
@@ -671,32 +685,13 @@ function Kong.preread()
 end
 
 
-function Kong.ssl_certificate()
-  kong_global.set_phase(kong, PHASES.certificate)
-
-  -- this doesn't really work across the phases currently (OpenResty 1.13.6.2),
-  -- but it returns a table (rewrite phase clears it)
-  local ctx = ngx.ctx
-  log_init_worker_errors(ctx)
-
-  -- this is the first phase to run on an HTTPS request
-  ctx.workspace = kong.default_workspace
-
-  runloop.certificate.before(ctx)
-  local plugins_iterator = runloop.get_updated_plugins_iterator()
-  execute_plugins_iterator(plugins_iterator, "certificate", ctx)
-  runloop.certificate.after(ctx)
-end
-
-
 function Kong.rewrite()
   local proxy_mode = var.kong_proxy_mode
   if proxy_mode == "grpc" or proxy_mode == "unbuffered"  then
-    kong_resty_ctx.apply_ref() -- if kong_proxy_mode is gRPC/unbuffered, this is executing
-    kong_resty_ctx.stash_ref() -- after an internal redirect. Restore (and restash)
-                               -- context to avoid re-executing phases
+    kong_resty_ctx.apply_ref()    -- if kong_proxy_mode is gRPC/unbuffered, this is executing
+    local ctx = ngx.ctx           -- after an internal redirect. Restore (and restash)
+    kong_resty_ctx.stash_ref(ctx) -- context to avoid re-executing phases
 
-    local ctx = ngx.ctx
     ctx.KONG_REWRITE_ENDED_AT = get_now_ms()
     ctx.KONG_REWRITE_TIME = ctx.KONG_REWRITE_ENDED_AT - ctx.KONG_REWRITE_START
 
@@ -705,7 +700,7 @@ function Kong.rewrite()
 
   local ctx = ngx.ctx
   if not ctx.KONG_PROCESSING_START then
-    ctx.KONG_PROCESSING_START = ngx.req.start_time() * 1000
+    ctx.KONG_PROCESSING_START = start_time() * 1000
   end
 
   if not ctx.KONG_REWRITE_START then
@@ -790,10 +785,193 @@ function Kong.access()
   -- we intent to proxy, though balancer may fail on that
   ctx.KONG_PROXIED = true
 
-  if ctx.buffered_proxying and ngx.req.http_version() < 2 then
-    return Kong.response()
+
+  if ctx.buffered_proxying then
+    local version = ngx.req.http_version()
+    local upgrade = var.upstream_upgrade or ""
+    if version < 2 and upgrade == "" then
+      return Kong.response()
+    end
+
+    if version >= 2 then
+      ngx_log(ngx_NOTICE, "response buffering was turned off: incompatible HTTP version (", version, ")")
+    else
+      ngx_log(ngx_NOTICE, "response buffering was turned off: connection upgrade (", upgrade, ")")
+    end
+
+    ctx.buffered_proxying = nil
   end
 end
+
+
+function Kong.balancer()
+  -- This may be called multiple times, and no yielding here!
+  local now_ms = get_now_ms()
+
+  local ctx = ngx.ctx
+  if not ctx.KONG_BALANCER_START then
+    ctx.KONG_BALANCER_START = now_ms
+
+    if subsystem == "stream" then
+      if ctx.KONG_PREREAD_START and not ctx.KONG_PREREAD_ENDED_AT then
+        ctx.KONG_PREREAD_ENDED_AT = ctx.KONG_BALANCER_START
+        ctx.KONG_PREREAD_TIME = ctx.KONG_PREREAD_ENDED_AT -
+                                ctx.KONG_PREREAD_START
+      end
+
+    else
+      if ctx.KONG_REWRITE_START and not ctx.KONG_REWRITE_ENDED_AT then
+        ctx.KONG_REWRITE_ENDED_AT = ctx.KONG_ACCESS_START or
+                                    ctx.KONG_BALANCER_START
+        ctx.KONG_REWRITE_TIME = ctx.KONG_REWRITE_ENDED_AT -
+                                ctx.KONG_REWRITE_START
+      end
+
+      if ctx.KONG_ACCESS_START and not ctx.KONG_ACCESS_ENDED_AT then
+        ctx.KONG_ACCESS_ENDED_AT = ctx.KONG_BALANCER_START
+        ctx.KONG_ACCESS_TIME = ctx.KONG_ACCESS_ENDED_AT -
+                               ctx.KONG_ACCESS_START
+      end
+    end
+  end
+
+  kong_global.set_phase(kong, PHASES.balancer)
+
+  local balancer_data = ctx.balancer_data
+  local tries = balancer_data.tries
+  local current_try = {}
+  balancer_data.try_count = balancer_data.try_count + 1
+  tries[balancer_data.try_count] = current_try
+
+  current_try.balancer_start = now_ms
+
+  if balancer_data.try_count > 1 then
+    -- only call balancer on retry, first one is done in `runloop.access.after`
+    -- which runs in the ACCESS context and hence has less limitations than
+    -- this BALANCER context where the retries are executed
+
+    -- record failure data
+    local previous_try = tries[balancer_data.try_count - 1]
+    previous_try.state, previous_try.code = get_last_failure()
+
+    -- Report HTTP status for health checks
+    local balancer = balancer_data.balancer
+    if balancer then
+      if previous_try.state == "failed" then
+        if previous_try.code == 504 then
+          balancer.report_timeout(balancer_data.balancer_handle)
+        else
+          balancer.report_tcp_failure(balancer_data.balancer_handle)
+        end
+
+      else
+        balancer.report_http_status(balancer_data.balancer_handle,
+                                    previous_try.code)
+      end
+    end
+
+    local ok, err, errcode = balancer_execute(balancer_data, ctx)
+    if not ok then
+      ngx_log(ngx_ERR, "failed to retry the dns/balancer resolver for ",
+              tostring(balancer_data.host), "' with: ", tostring(err))
+
+      ctx.KONG_BALANCER_ENDED_AT = get_now_ms()
+      ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_BALANCER_START
+      ctx.KONG_PROXY_LATENCY = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_PROCESSING_START
+
+      return ngx.exit(errcode)
+    end
+
+    ok, err = balancer_set_host_header(balancer_data)
+    if not ok then
+      ngx_log(ngx_ERR, "failed to set balancer Host header: ", err)
+
+      return ngx.exit(500)
+    end
+
+  else
+    -- first try, so set the max number of retries
+    local retries = balancer_data.retries
+    if retries > 0 then
+      set_more_tries(retries)
+    end
+  end
+
+  local pool_opts
+  local kong_conf = kong.configuration
+
+  if enable_keepalive and kong_conf.upstream_keepalive_pool_size > 0
+     and subsystem == "http"
+  then
+    local pool = balancer_data.ip .. "|" .. balancer_data.port
+
+    if balancer_data.scheme == "https" then
+      -- upstream_host is SNI
+      pool = pool .. "|" .. var.upstream_host
+
+      if ctx.service and ctx.service.client_certificate then
+        pool = pool .. "|" .. ctx.service.client_certificate.id
+      end
+    end
+
+    pool_opts = {
+      pool = pool,
+      pool_size = kong_conf.upstream_keepalive_pool_size,
+    }
+  end
+
+  current_try.ip   = balancer_data.ip
+  current_try.port = balancer_data.port
+
+  -- set the targets as resolved
+  ngx_log(ngx_DEBUG, "setting address (try ", balancer_data.try_count, "): ",
+                     balancer_data.ip, ":", balancer_data.port)
+  local ok, err = set_current_peer(balancer_data.ip, balancer_data.port, pool_opts)
+  if not ok then
+    ngx_log(ngx_ERR, "failed to set the current peer (address: ",
+            tostring(balancer_data.ip), " port: ", tostring(balancer_data.port),
+            "): ", tostring(err))
+
+    ctx.KONG_BALANCER_ENDED_AT = get_now_ms()
+    ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_BALANCER_START
+    ctx.KONG_PROXY_LATENCY = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_PROCESSING_START
+
+    return ngx.exit(500)
+  end
+
+  ok, err = set_timeouts(balancer_data.connect_timeout / 1000,
+                         balancer_data.send_timeout / 1000,
+                         balancer_data.read_timeout / 1000)
+  if not ok then
+    ngx_log(ngx_ERR, "could not set upstream timeouts: ", err)
+  end
+
+  if pool_opts then
+    ok, err = enable_keepalive(kong_conf.upstream_keepalive_idle_timeout,
+                               kong_conf.upstream_keepalive_max_requests)
+    if not ok then
+      ngx_log(ngx_ERR, "could not enable connection keepalive: ", err)
+    end
+
+    ngx_log(ngx_DEBUG, "enabled connection keepalive (pool=", pool_opts.pool,
+                       ", pool_size=", pool_opts.pool_size,
+                       ", idle_timeout=", kong_conf.upstream_keepalive_idle_timeout,
+                       ", max_requests=", kong_conf.upstream_keepalive_max_requests, ")")
+  end
+
+  -- record overall latency
+  ctx.KONG_BALANCER_ENDED_AT = get_now_ms()
+  ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_BALANCER_START
+
+  -- record try-latency
+  local try_latency = ctx.KONG_BALANCER_ENDED_AT - current_try.balancer_start
+  current_try.balancer_latency = try_latency
+
+  -- time spent in Kong before sending the request to upstream
+  -- start_time() is kept in seconds with millisecond resolution.
+  ctx.KONG_PROXY_LATENCY = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_PROCESSING_START
+end
+
 
 do
   local HTTP_METHODS = {
@@ -884,172 +1062,10 @@ do
 end
 
 
-function Kong.balancer()
-  -- This may be called multiple times, and no yielding here!
-  local now_ms = get_now_ms()
-
-  local ctx = ngx.ctx
-  if not ctx.KONG_BALANCER_START then
-    ctx.KONG_BALANCER_START = now_ms
-
-    if subsystem == "stream" then
-      if ctx.KONG_PREREAD_START and not ctx.KONG_PREREAD_ENDED_AT then
-        ctx.KONG_PREREAD_ENDED_AT = ctx.KONG_BALANCER_START
-        ctx.KONG_PREREAD_TIME = ctx.KONG_PREREAD_ENDED_AT -
-                                ctx.KONG_PREREAD_START
-      end
-
-    else
-      if ctx.KONG_REWRITE_START and not ctx.KONG_REWRITE_ENDED_AT then
-        ctx.KONG_REWRITE_ENDED_AT = ctx.KONG_ACCESS_START or
-                                    ctx.KONG_BALANCER_START
-        ctx.KONG_REWRITE_TIME = ctx.KONG_REWRITE_ENDED_AT -
-                                ctx.KONG_REWRITE_START
-      end
-
-      if ctx.KONG_ACCESS_START and not ctx.KONG_ACCESS_ENDED_AT then
-        ctx.KONG_ACCESS_ENDED_AT = ctx.KONG_BALANCER_START
-        ctx.KONG_ACCESS_TIME = ctx.KONG_ACCESS_ENDED_AT -
-                               ctx.KONG_ACCESS_START
-      end
-    end
-  end
-
-  kong_global.set_phase(kong, PHASES.balancer)
-
-  local balancer_data = ctx.balancer_data
-  local tries = balancer_data.tries
-  local current_try = {}
-  balancer_data.try_count = balancer_data.try_count + 1
-  tries[balancer_data.try_count] = current_try
-
-  current_try.balancer_start = now_ms
-
-  if balancer_data.try_count > 1 then
-    -- only call balancer on retry, first one is done in `runloop.access.after`
-    -- which runs in the ACCESS context and hence has less limitations than
-    -- this BALANCER context where the retries are executed
-
-    -- record failure data
-    local previous_try = tries[balancer_data.try_count - 1]
-    previous_try.state, previous_try.code = get_last_failure()
-
-    -- Report HTTP status for health checks
-    local balancer = balancer_data.balancer
-    if balancer then
-      if previous_try.state == "failed" then
-        if previous_try.code == 504 then
-          balancer.report_timeout(balancer_data.balancer_handle)
-        else
-          balancer.report_tcp_failure(balancer_data.balancer_handle)
-        end
-
-      else
-        balancer.report_http_status(balancer_data.balancer_handle,
-                                    previous_try.code)
-      end
-    end
-
-    local ok, err, errcode = balancer_execute(balancer_data)
-    if not ok then
-      ngx_log(ngx_ERR, "failed to retry the dns/balancer resolver for ",
-              tostring(balancer_data.host), "' with: ", tostring(err))
-
-      ctx.KONG_BALANCER_ENDED_AT = get_now_ms()
-      ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_BALANCER_START
-      ctx.KONG_PROXY_LATENCY = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_PROCESSING_START
-
-      return ngx.exit(errcode)
-    end
-
-  else
-    -- first try, so set the max number of retries
-    local retries = balancer_data.retries
-    if retries > 0 then
-      set_more_tries(retries)
-    end
-  end
-
-  local pool_opts
-  local kong_conf = kong.configuration
-
-  if enable_keepalive and kong_conf.upstream_keepalive_pool_size > 0
-     and subsystem == "http"
-  then
-    local pool = balancer_data.ip .. "|" .. balancer_data.port
-
-    if balancer_data.scheme == "https" then
-      -- upstream_host is SNI
-      pool = pool .. "|" .. var.upstream_host
-
-      if ctx.service and ctx.service.client_certificate then
-        pool = pool .. "|" .. ctx.service.client_certificate.id
-      end
-    end
-
-    pool_opts = {
-      pool = pool,
-      pool_size = kong_conf.upstream_keepalive_pool_size,
-    }
-  end
-
-  current_try.ip   = balancer_data.ip
-  current_try.port = balancer_data.port
-
-  -- set the targets as resolved
-  ngx_log(ngx_DEBUG, "setting address (try ", balancer_data.try_count, "): ",
-                     balancer_data.ip, ":", balancer_data.port)
-  local ok, err = set_current_peer(balancer_data.ip, balancer_data.port, pool_opts)
-  if not ok then
-    ngx_log(ngx_ERR, "failed to set the current peer (address: ",
-            tostring(balancer_data.ip), " port: ", tostring(balancer_data.port),
-            "): ", tostring(err))
-
-    ctx.KONG_BALANCER_ENDED_AT = get_now_ms()
-    ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_BALANCER_START
-    ctx.KONG_PROXY_LATENCY = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_PROCESSING_START
-
-    return ngx.exit(500)
-  end
-
-  ok, err = set_timeouts(balancer_data.connect_timeout / 1000,
-                         balancer_data.send_timeout / 1000,
-                         balancer_data.read_timeout / 1000)
-  if not ok then
-    ngx_log(ngx_ERR, "could not set upstream timeouts: ", err)
-  end
-
-  if pool_opts then
-    ok, err = enable_keepalive(kong_conf.upstream_keepalive_idle_timeout,
-                               kong_conf.upstream_keepalive_max_requests)
-    if not ok then
-      ngx_log(ngx_ERR, "could not enable connection keepalive: ", err)
-    end
-
-    ngx_log(ngx_DEBUG, "enabled connection keepalive (pool=", pool_opts.pool,
-                       ", pool_size=", pool_opts.pool_size,
-                       ", idle_timeout=", kong_conf.upstream_keepalive_idle_timeout,
-                       ", max_requests=", kong_conf.upstream_keepalive_max_requests, ")")
-  end
-
-  -- record overall latency
-  ctx.KONG_BALANCER_ENDED_AT = get_now_ms()
-  ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_BALANCER_START
-
-  -- record try-latency
-  local try_latency = ctx.KONG_BALANCER_ENDED_AT - current_try.balancer_start
-  current_try.balancer_latency = try_latency
-
-  -- time spent in Kong before sending the request to upstream
-  -- start_time() is kept in seconds with millisecond resolution.
-  ctx.KONG_PROXY_LATENCY = ctx.KONG_BALANCER_ENDED_AT - ctx.KONG_PROCESSING_START
-end
-
-
 function Kong.header_filter()
   local ctx = ngx.ctx
   if not ctx.KONG_PROCESSING_START then
-    ctx.KONG_PROCESSING_START = ngx.req.start_time() * 1000
+    ctx.KONG_PROCESSING_START = start_time() * 1000
   end
 
   if not ctx.workspace then
@@ -1199,6 +1215,10 @@ function Kong.log()
   if not ctx.KONG_LOG_START then
     ctx.KONG_LOG_START = get_now_ms()
     if subsystem == "stream" then
+      if not ctx.KONG_PROCESSING_START then
+        ctx.KONG_PROCESSING_START = start_time() * 1000
+      end
+
       if ctx.KONG_PREREAD_START and not ctx.KONG_PREREAD_ENDED_AT then
         ctx.KONG_PREREAD_ENDED_AT = ctx.KONG_LOG_START
         ctx.KONG_PREREAD_TIME = ctx.KONG_PREREAD_ENDED_AT -
@@ -1209,6 +1229,17 @@ function Kong.log()
         ctx.KONG_BALANCER_ENDED_AT = ctx.KONG_LOG_START
         ctx.KONG_BALANCER_TIME = ctx.KONG_BALANCER_ENDED_AT -
                                  ctx.KONG_BALANCER_START
+      end
+
+      if ctx.KONG_PROXIED then
+        if not ctx.KONG_PROXY_LATENCY then
+          ctx.KONG_PROXY_LATENCY = ctx.KONG_LOG_START -
+                                   ctx.KONG_PROCESSING_START
+        end
+
+      elseif not ctx.KONG_RESPONSE_LATENCY then
+        ctx.KONG_RESPONSE_LATENCY = ctx.KONG_LOG_START -
+                                    ctx.KONG_PROCESSING_START
       end
 
     else
@@ -1302,7 +1333,7 @@ local function serve_content(module, options)
   kong_global.set_phase(kong, PHASES.admin_api)
 
   local ctx = ngx.ctx
-  ctx.KONG_PROCESSING_START = ngx.req.start_time() * 1000
+  ctx.KONG_PROCESSING_START = start_time() * 1000
   ctx.KONG_ADMIN_CONTENT_START = ctx.KONG_ADMIN_CONTENT_START or get_now_ms()
 
 
@@ -1351,7 +1382,7 @@ function Kong.admin_header_filter()
   local ctx = ngx.ctx
 
   if not ctx.KONG_PROCESSING_START then
-    ctx.KONG_PROCESSING_START = ngx.req.start_time() * 1000
+    ctx.KONG_PROCESSING_START = start_time() * 1000
   end
 
   if not ctx.KONG_ADMIN_HEADER_FILTER_START then

@@ -587,6 +587,8 @@ local CONF_INFERENCES = {
 
   proxy_access_log = { typ = "string" },
   proxy_error_log = { typ = "string" },
+  proxy_stream_access_log = { typ = "string" },
+  proxy_stream_error_log = { typ = "string" },
   admin_access_log = { typ = "string" },
   admin_error_log = { typ = "string" },
   status_access_log = { typ = "string" },
@@ -611,6 +613,13 @@ local CONF_INFERENCES = {
 
   lua_ssl_trusted_certificate = { typ = "array" },
   lua_ssl_verify_depth = { typ = "number" },
+  lua_ssl_protocols = {
+    typ = "string",
+    directives = {
+      "nginx_http_lua_ssl_protocols",
+      "nginx_stream_lua_ssl_protocols",
+    },
+  },
   lua_socket_pool_size = { typ = "number" },
 
   role = { enum = { "data_plane", "control_plane", "traditional", }, },
@@ -621,6 +630,8 @@ local CONF_INFERENCES = {
   cluster_ca_cert = { typ = "string" },
   cluster_server_name = { typ = "string" },
   cluster_data_plane_purge_delay = { typ = "number" },
+  cluster_ocsp = { enum = { "on", "off", "optional" } },
+
   kic = { typ = "boolean" },
   pluginserver_names = { typ = "array" },
 

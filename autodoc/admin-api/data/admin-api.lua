@@ -334,6 +334,35 @@ return {
           ]],
         },
       },
+      ["/schemas/plugins/validate"] = {
+        POST = {
+          title = [[Validate a plugin configuration against the schema]],
+          endpoint = [[<div class="endpoint post">/schemas/plugins/validate</div>]],
+          description = [[
+            Check validity of a plugin configuration against the plugins entity schema.
+            This allows you to test your input before submitting a request
+            to the entity endpoints of the Admin API.
+
+            Note that this only performs the schema validation checks,
+            checking that the input configuration is well-formed.
+            A requests to the entity endpoint using the given configuration
+            may still fail due to other reasons, such as invalid foreign
+            key relationships or uniqueness check failures against the
+            contents of the data store.
+          ]],
+          response =[[
+            ```
+            HTTP 200 OK
+            ```
+
+            ```json
+            {
+                "message": "schema validation successful"
+            }
+            ```
+          ]],
+        },
+      },
     },
     health = {
       title = [[Health routes]],
@@ -451,8 +480,12 @@ return {
     tags = {
       title = [[ Tags ]],
       description = [[
-        Tags are strings associated to entities in Kong. Each tag must be composed of one or more
-        alphanumeric characters, `_`, `-`, `.` or `~`.
+        Tags are strings associated to entities in Kong.
+
+        Tags can contain almost all UTF-8 characters, with the following exceptions:
+
+        - `,` and `/` are reserved for filtering tags with "and" and "or", so they are not allowed in tags.
+        - Non-printable ASCII (for example, the space character) is not allowed.
 
         Most core entities can be *tagged* via their `tags` attribute, upon creation or edition.
 

@@ -1,7 +1,7 @@
 OS := $(shell uname | awk '{print tolower($$0)}')
 MACHINE := $(shell uname -m)
 
-DEV_ROCKS = "busted 2.0.0" "busted-htest 1.0.0" "luacheck 0.24.0" "lua-llthreads2 0.1.5" "http 0.3" "ldoc 1.4.6"
+DEV_ROCKS = "busted 2.0.0" "busted-htest 1.0.0" "luacheck 0.24.0" "lua-llthreads2 0.1.6" "http 0.4" "ldoc 1.4.6"
 WIN_SCRIPTS = "bin/busted" "bin/kong"
 BUSTED_ARGS ?= -v
 TEST_CMD ?= bin/busted $(BUSTED_ARGS)
@@ -99,7 +99,7 @@ setup-kong-build-tools:
 	-rm -rf $(KONG_BUILD_TOOLS_LOCATION)
 	-git clone https://github.com/Kong/kong-build-tools.git $(KONG_BUILD_TOOLS_LOCATION)
 	cd $(KONG_BUILD_TOOLS_LOCATION); \
-	git reset --hard $(KONG_BUILD_TOOLS); \
+	git reset --hard && git checkout $(KONG_BUILD_TOOLS); \
 
 functional-tests: setup-kong-build-tools
 	cd $(KONG_BUILD_TOOLS_LOCATION); \
@@ -137,8 +137,8 @@ dev: remove install dependencies
 
 lint:
 	@luacheck -q .
-	@!(grep -R -E -n -w '#only|#o' spec && echo "#only or #o tag detected") >&2
-	@!(grep -R -E -n -- '---\s+ONLY' t && echo "--- ONLY block detected") >&2
+	@!(grep -R -E -I -n -w '#only|#o' spec && echo "#only or #o tag detected") >&2
+	@!(grep -R -E -I -n -- '---\s+ONLY' t && echo "--- ONLY block detected") >&2
 
 test:
 	@$(TEST_CMD) spec/01-unit

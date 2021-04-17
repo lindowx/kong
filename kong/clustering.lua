@@ -5,6 +5,8 @@ local semaphore = require("ngx.semaphore")
 local ws_client = require("resty.websocket.client")
 local ws_server = require("resty.websocket.server")
 local ssl = require("ngx.ssl")
+local ocsp = require("ngx.ocsp")
+local http = require("resty.http")
 local cjson = require("cjson.safe")
 local declarative = require("kong.db.declarative")
 local utils = require("kong.tools.utils")
@@ -20,6 +22,7 @@ local type = type
 local math = math
 local pcall = pcall
 local pairs = pairs
+local tostring = tostring
 local ngx = ngx
 local ngx_log = ngx.log
 local ngx_sleep = ngx.sleep
@@ -29,6 +32,7 @@ local kong = kong
 local ngx_exit = ngx.exit
 local exiting = ngx.worker.exiting
 local ngx_time = ngx.time
+local ngx_now = ngx.now
 local ngx_var = ngx.var
 local io_open = io.open
 local table_insert = table.insert
@@ -41,6 +45,7 @@ local KONG_VERSION = kong.version
 local MAX_PAYLOAD = 4 * 1024 * 1024 -- 4MB
 local PING_INTERVAL = 30 -- 30 seconds
 local PING_WAIT = PING_INTERVAL * 1.5
+local OCSP_TIMEOUT = 5000
 local WS_OPTS = {
   timeout = 5000,
   max_payload_len = MAX_PAYLOAD,
@@ -59,6 +64,9 @@ local clients = setmetatable({}, WEAK_KEY_MT)
 local prefix = ngx.config.prefix()
 local CONFIG_CACHE = prefix .. "/config.cache.json.gz"
 local CLUSTERING_SYNC_STATUS = kong_constants.CLUSTERING_SYNC_STATUS
+local deflated_reconfigure_payload -- Contains a compressed (zlib) payload of the latest database export,
+                                   -- that can be used to send configuration to new clients even in a case
+                                   -- of a database outage.
 local declarative_config
 local next_config
 
@@ -261,6 +269,7 @@ local function communicate(premature, conf)
 
       else
         if typ == "close" then
+          ngx_log(ngx_DEBUG, "received CLOSE frame from control plane")
           return
         end
 
@@ -272,6 +281,13 @@ local function communicate(premature, conf)
           local msg = assert(cjson_decode(data))
 
           if msg.type == "reconfigure" then
+            if msg.timestamp then
+              ngx_log(ngx_DEBUG, "received RECONFIGURE frame from control plane with timestamp: ", msg.timestamp)
+
+            else
+              ngx_log(ngx_DEBUG, "received RECONFIGURE frame from control plane")
+            end
+
             next_config = assert(msg.config_table)
 
             if config_semaphore:count() <= 0 then
@@ -286,6 +302,9 @@ local function communicate(premature, conf)
 
         elseif typ == "pong" then
           ngx_log(ngx_DEBUG, "received PONG frame from control plane")
+
+        else
+          ngx_log(ngx_NOTICE, "received UNKNOWN (", tostring(typ), ") frame from control plane")
         end
       end
     end
@@ -333,7 +352,70 @@ local function validate_shared_cert()
 end
 
 
-local MAJOR_MINOR_PATTERN = "^(%d+%.%d+)%.%d+"
+local check_for_revocation_status
+do
+  local get_full_client_certificate_chain = require("resty.kong.tls").get_full_client_certificate_chain
+  check_for_revocation_status = function ()
+    local cert, err = get_full_client_certificate_chain()
+    if not cert then
+      return nil, err
+    end
+
+    local der_cert
+    der_cert, err = ssl.cert_pem_to_der(cert)
+    if not der_cert then
+      return nil, "failed to convert certificate chain from PEM to DER: " .. err
+    end
+
+    local ocsp_url
+    ocsp_url, err = ocsp.get_ocsp_responder_from_der_chain(der_cert)
+    if not ocsp_url then
+      return nil, err or "OCSP responder endpoint can not be determined, " ..
+                         "maybe the client certificate is missing the " ..
+                         "required extensions"
+    end
+
+    local ocsp_req
+    ocsp_req, err = ocsp.create_ocsp_request(der_cert)
+    if not ocsp_req then
+      return nil, "failed to create OCSP request: " .. err
+    end
+
+    local c = http.new()
+    local res
+    res, err = c:request_uri(ocsp_url, {
+      headers = {
+        ["Content-Type"] = "application/ocsp-request"
+      },
+      timeout = OCSP_TIMEOUT,
+      method = "POST",
+      body = ocsp_req,
+    })
+
+    if not res then
+      return nil, "failed sending request to OCSP responder: " .. tostring(err)
+    end
+    if res.status ~= 200 then
+      return nil, "OCSP responder returns bad HTTP status code: " .. res.status
+    end
+
+    local ocsp_resp = res.body
+    if not ocsp_resp or #ocsp_resp == 0 then
+      return nil, "unexpected response from OCSP responder: empty body"
+    end
+
+    res, err = ocsp.validate_ocsp_response(ocsp_resp, der_cert)
+    if not res then
+      return false, "failed to validate OCSP response: " .. err
+    end
+
+    return true
+  end
+end
+
+
+local MAJOR_MINOR_PATTERN = "^(%d+)%.(%d+)%.%d+"
+
 local function should_send_config_update(node_version, node_plugins)
   if not node_version or not node_plugins then
     return false, "your DP did not provide version information to the CP, " ..
@@ -343,30 +425,90 @@ local function should_send_config_update(node_version, node_plugins)
                   "automatically once this DP also upgrades to 2.3 or later"
   end
 
-  local minor_cp = KONG_VERSION:match(MAJOR_MINOR_PATTERN)
-  local minor_node = node_version:match(MAJOR_MINOR_PATTERN)
-  if minor_cp ~= minor_node then
-    return false, "version mismatches, CP version: " .. minor_cp ..
-                  " DP version: " .. minor_node,
+  local major_cp, minor_cp = KONG_VERSION:match(MAJOR_MINOR_PATTERN)
+  local major_node, minor_node = node_version:match(MAJOR_MINOR_PATTERN)
+  minor_cp = tonumber(minor_cp)
+  minor_node = tonumber(minor_node)
+
+  if major_cp ~= major_node or minor_cp - 2 > minor_node or minor_cp < minor_node then
+    return false, "version incompatible, CP version: " .. KONG_VERSION ..
+                  " DP version: " .. node_version ..
+                  " DP versions acceptable are " ..
+                  major_cp .. "." .. math.max(0, minor_cp - 2) .. " to " ..
+                  major_cp .. "." .. minor_cp .. "(edges included)",
                   CLUSTERING_SYNC_STATUS.KONG_VERSION_INCOMPATIBLE
   end
 
-  for i, p in ipairs(PLUGINS_LIST) do
-    local np = node_plugins[i]
+  -- allow DP to have a superset of CP's plugins
+  local p, np
+  local i, j = #PLUGINS_LIST, #node_plugins
+
+  if j < i then
+    return false, "CP and DP does not have same set of plugins installed",
+                  CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
+  end
+
+  while i > 0 and j > 0 do
+    p = PLUGINS_LIST[i]
+    np = node_plugins[j]
+
     if p.name ~= np.name then
-      return false, "CP and DP does not have same set of plugins installed",
-                    CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
+      goto continue
     end
 
-    if p.version ~= np.version then
-      return false, "plugin \"" .. p.name .. "\" version differs between " ..
-                    "CP and DP, CP has version " .. tostring(p.version) ..
-                    " while DP has version " .. tostring(np.version),
-                    CLUSTERING_SYNC_STATUS.PLUGIN_VERSION_INCOMPATIBLE
+    -- ignore plugins without a version (route-by-header is deprecated)
+    if p.version and np.version then
+      -- major/minor check that ignores anything after the second digit
+      local major_minor_p = p.version:match("^(%d+%.%d+)") or "not_a_version"
+      local major_minor_np = np.version:match("^(%d+%.%d+)") or "still_not_a_version"
+
+      if major_minor_p ~= major_minor_np then
+        return false, "plugin \"" .. p.name .. "\" version incompatible, " ..
+                      "CP version: " .. tostring(p.version) ..
+                      " DP version: " .. tostring(np.version) ..
+                      " DP plugin version acceptable is "..
+                      major_minor_p .. ".x",
+                      CLUSTERING_SYNC_STATUS.PLUGIN_VERSION_INCOMPATIBLE
+      end
     end
+
+    i = i - 1
+    ::continue::
+    j = j - 1
+  end
+
+  if i > 0 then
+    return false, "CP and DP does not have same set of plugins installed",
+                  CLUSTERING_SYNC_STATUS.PLUGIN_SET_INCOMPATIBLE
   end
 
   return true
+end
+
+
+local function export_deflated_reconfigure_payload()
+  local config_table, err = declarative.export_config()
+  if not config_table then
+    return nil, err
+  end
+
+  local payload, err = cjson_encode({
+    type = "reconfigure",
+    timestamp = ngx_now(),
+    config_table = config_table,
+  })
+  if not payload then
+    return nil, err
+  end
+
+  payload, err = deflate_gzip(payload)
+  if not payload then
+    return nil, err
+  end
+
+  deflated_reconfigure_payload = payload
+
+  return payload
 end
 
 
@@ -374,6 +516,19 @@ function _M.handle_cp_websocket()
   -- use mutual TLS authentication
   if kong.configuration.cluster_mtls == "shared" then
     validate_shared_cert()
+
+  elseif kong.configuration.cluster_ocsp ~= "off" then
+    local res, err = check_for_revocation_status()
+    if res == false then
+      ngx_log(ngx_ERR, "DP client certificate was revoked: ", err)
+      return ngx_exit(444)
+
+    elseif not res then
+      ngx_log(ngx_WARN, "DP client certificate revocation check failed: ", err)
+      if kong.configuration.cluster_ocsp == "on" then
+        return ngx_exit(444)
+      end
+    end
   end
 
   local node_id = ngx_var.arg_node_id
@@ -426,16 +581,12 @@ function _M.handle_cp_websocket()
   res, err, sync_status = should_send_config_update(node_version, node_plugins)
   if res then
     sync_status = CLUSTERING_SYNC_STATUS.NORMAL
-    local config_table
-    -- unconditionally send config update to new clients to
-    -- ensure they have latest version running
-    config_table, err = declarative.export_config()
-    if config_table then
-      local payload = cjson_encode({ type = "reconfigure",
-                                     config_table = config_table,
-                                   })
-      payload = assert(deflate_gzip(payload))
-      table_insert(queue, payload)
+    if not deflated_reconfigure_payload then
+      assert(export_deflated_reconfigure_payload())
+    end
+
+    if deflated_reconfigure_payload then
+      table_insert(queue, deflated_reconfigure_payload)
       queue.post()
 
     else
@@ -594,27 +745,17 @@ function _M.handle_cp_websocket()
 end
 
 
-local function push_config(config_table)
-  if not config_table then
-    local err
-    config_table, err = declarative.export_config()
-    if not config_table then
-      ngx_log(ngx_ERR, "unable to export config from database: " .. err)
-      return
-    end
+local function push_config()
+  local payload, err = export_deflated_reconfigure_payload()
+  if not payload then
+    ngx_log(ngx_ERR, "unable to export config from database: " .. err)
+    return
   end
 
-  local payload = cjson_encode({ type = "reconfigure",
-                                 config_table = config_table,
-                               })
-  payload = assert(deflate_gzip(payload))
-
   local n = 0
-
   for _, queue in pairs(clients) do
     table_insert(queue, payload)
     queue.post()
-
     n = n + 1
   end
 
@@ -622,13 +763,18 @@ local function push_config(config_table)
 end
 
 
-local function push_config_timer(premature, semaphore, delay)
+local function push_config_timer(premature, push_config_semaphore, delay)
   if premature then
     return
   end
 
+  local _, err = export_deflated_reconfigure_payload()
+  if err then
+    ngx_log(ngx_ERR, "unable to export initial config from database: " .. err)
+  end
+
   while not exiting() do
-    local ok, err = semaphore:wait(1)
+    local ok, err = push_config_semaphore:wait(1)
     if exiting() then
       return
     end

@@ -10,6 +10,7 @@ local constants    = require "kong.constants"
 local singletons   = require "kong.singletons"
 local certificate  = require "kong.runloop.certificate"
 local concurrency  = require "kong.concurrency"
+local declarative  = require "kong.db.declarative"
 local PluginsIterator = require "kong.runloop.plugins_iterator"
 
 
@@ -201,7 +202,7 @@ local function register_events()
 
         balancer.init()
 
-        ngx.shared.kong:incr(constants.DECLARATIVE_FLIPS.name, 1, 0, constants.DECLARATIVE_FLIPS.ttl)
+        declarative.lock()
 
         return true
       end)
@@ -443,6 +444,9 @@ local function register_events()
   worker_events.register(function(data)
     local operation = data.operation
     local upstream = data.entity
+
+    singletons.core_cache:invalidate_local("balancer:upstreams")
+    singletons.core_cache:invalidate_local("balancer:upstreams:" .. upstream.id)
 
     -- => to balancer update
     balancer.on_upstream_event(operation, upstream)
@@ -1053,6 +1057,12 @@ return {
     end,
     after = NOOP,
   },
+  certificate = {
+    before = function(_)
+      certificate.execute()
+    end,
+    after = NOOP,
+  },
   preread = {
     before = function(ctx)
       ctx.host_port = HOST_PORTS[var.server_port] or var.server_port
@@ -1084,12 +1094,6 @@ return {
         return kong.response.exit(errcode, body)
       end
     end
-  },
-  certificate = {
-    before = function(_)
-      certificate.execute()
-    end,
-    after = NOOP,
   },
   rewrite = {
     before = function(ctx)
@@ -1242,7 +1246,8 @@ return {
       var.upstream_host   = match_t.upstream_host
 
       -- Keep-Alive and WebSocket Protocol Upgrade Headers
-      if var.http_upgrade and lower(var.http_upgrade) == "websocket" then
+      local upgrade = var.http_upgrade
+      if upgrade and lower(upgrade) == "websocket" then
         var.upstream_connection = "keep-alive, Upgrade"
         var.upstream_upgrade    = "websocket"
 
@@ -1307,6 +1312,15 @@ return {
       local balancer_data = ctx.balancer_data
       balancer_data.scheme = var.upstream_scheme -- COMPAT: pdk
 
+      -- The content of var.upstream_host is only set by the router if
+      -- preserve_host is true
+      --
+      -- We can't rely on var.upstream_host for balancer retries inside
+      -- `set_host_header` because it would never be empty after the first -- balancer try
+      if var.upstream_host ~= nil and var.upstream_host ~= "" then
+        balancer_data.preserve_host = true
+      end
+
       local ok, err, errcode = balancer_execute(ctx)
       if not ok then
         local body = utils.get_default_exit_body(errcode, err)
@@ -1315,33 +1329,22 @@ return {
 
       var.upstream_scheme = balancer_data.scheme
 
-      do
-        -- set the upstream host header if not `preserve_host`
-        local upstream_host = var.upstream_host
-        local upstream_scheme = var.upstream_scheme
+      local ok, err = balancer.set_host_header(balancer_data)
+      if not ok then
+        ngx.log(ngx.ERR, "failed to set balancer Host header: ", err)
 
-        if not upstream_host or upstream_host == "" then
-          upstream_host = balancer_data.hostname
+        return ngx.exit(500)
+      end
 
-          if upstream_scheme == "http"  and balancer_data.port ~= 80 or
-             upstream_scheme == "https" and balancer_data.port ~= 443 or
-             upstream_scheme == "grpc"  and balancer_data.port ~= 80 or
-             upstream_scheme == "grpcs" and balancer_data.port ~= 443
-          then
-            upstream_host = upstream_host .. ":" .. balancer_data.port
-          end
+      -- the nginx grpc module does not offer a way to overrride the
+      -- :authority pseudo-header; use our internal API to do so
+      local upstream_host = var.upstream_host
+      local upstream_scheme = var.upstream_scheme
 
-          var.upstream_host = upstream_host
-        end
-
-        -- the nginx grpc module does not offer a way to overrride
-        -- the :authority pseudo-header; use our internal API to
-        -- do so
-        if upstream_scheme == "grpc" or upstream_scheme == "grpcs" then
-          ok, err = kong.service.request.set_header(":authority", upstream_host)
-          if not ok then
-            log(ERR, "failed to set :authority header: ", err)
-          end
+      if upstream_scheme == "grpc" or upstream_scheme == "grpcs" then
+        ok, err = kong.service.request.set_header(":authority", upstream_host)
+        if not ok then
+          log(ERR, "failed to set :authority header: ", err)
         end
       end
 
@@ -1397,11 +1400,13 @@ return {
 
       -- clear hop-by-hop response headers:
       for _, header_name in csv(var.upstream_http_connection) do
-        header[header_name] = nil
+        if header_name ~= "close" and header_name ~= "upgrade" and header_name ~= "keep-alive" then
+          header[header_name] = nil
+        end
       end
 
-      if var.upstream_http_upgrade and
-         lower(var.upstream_http_upgrade) ~= lower(var.upstream_upgrade) then
+      local upgrade = var.upstream_http_upgrade
+      if upgrade and lower(upgrade) ~= lower(var.upstream_upgrade) then
         header["Upgrade"] = nil
       end
 
@@ -1419,6 +1424,19 @@ return {
         header[upstream_status_header] = tonumber(sub(var.upstream_status or "", -3))
         if not header[upstream_status_header] then
           log(ERR, "failed to set ", upstream_status_header, " header")
+        end
+      end
+
+      -- if this is the last try and it failed, save its state to correctly log it
+      local status = ngx.status
+      if status > 499 and ctx.balancer_data then
+        local balancer_data = ctx.balancer_data
+        local try_count = balancer_data.try_count
+        local retries = balancer_data.retries
+        if try_count > retries then
+          local current_try = balancer_data.tries[try_count]
+          current_try.state = "failed"
+          current_try.code = status
         end
       end
 
